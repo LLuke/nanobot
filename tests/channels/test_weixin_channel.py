@@ -1374,8 +1374,8 @@ async def test_send_text_retries_without_context_token_on_ret_minus_two() -> Non
 
     channel._api_post = AsyncMock(
         side_effect=[
-            {"ret": -2},  # first attempt with token fails
-            {"ret": 0},   # retry without token succeeds
+            {"ret": -2, "errmsg": "unknown error"},  # stale session with token
+            {"ret": 0},                              # retry without token succeeds
         ]
     )
 
@@ -1394,8 +1394,8 @@ async def test_send_text_retries_without_context_token_on_ret_minus_two() -> Non
 
 
 @pytest.mark.asyncio
-async def test_send_text_raises_when_retry_also_fails_with_stale_session() -> None:
-    """If both attempts return stale-session ret=-2, raise so ChannelManager retries."""
+async def test_send_text_stale_session_retries_without_token_then_rate_limit_backoff(monkeypatch) -> None:
+    """Stale-session 'unknown error' triggers tokenless retry, then rate-limit backoff."""
     channel, _bus = _make_channel()
     channel._client = object()
     channel._token = "token"
@@ -1403,33 +1403,44 @@ async def test_send_text_raises_when_retry_also_fails_with_stale_session() -> No
 
     channel._api_post = AsyncMock(
         side_effect=[
-            {"ret": -2},  # with token
-            {"ret": -2},  # without token
+            {"ret": -2, "errmsg": "unknown error"},  # with token
+            {"ret": -2, "errmsg": "unknown error"},  # without token
+            {"ret": -2, "errmsg": "unknown error"},  # rate-limit retry
         ]
     )
+
+    # Speed up the 60-second backoff for testing
+    monkeypatch.setattr(weixin_mod, "RATE_LIMIT_BACKOFF_S", 0)
 
     with pytest.raises(RuntimeError, match="WeChat send text error"):
         await channel._send_text("wx-user", "hello", "bad-token")
 
-    assert channel._api_post.await_count == 2
-    # Token is NOT cleared because retry also failed
+    # 3 calls: original + tokenless + rate-limit retry
+    assert channel._api_post.await_count == 3
+    # Token is NOT cleared because tokenless retry also failed
     assert channel._context_tokens.get("wx-user") == "bad-token"
 
 
 @pytest.mark.asyncio
-async def test_send_text_raises_on_ret_minus_two_when_no_context_token() -> None:
-    """If no context_token was provided, ret=-2 stale session is raised."""
+async def test_send_text_rate_limit_with_empty_errmsg_waits_and_retries(monkeypatch) -> None:
+    """Empty errmsg ret=-2 is treated as rate limit: wait then retry once."""
     channel, _bus = _make_channel()
     channel._client = object()
     channel._token = "token"
 
-    channel._api_post = AsyncMock(return_value={"ret": -2})
+    channel._api_post = AsyncMock(
+        side_effect=[
+            {"ret": -2},  # first attempt — rate limit
+            {"ret": -2},  # backoff retry — still rate limit
+        ]
+    )
+
+    monkeypatch.setattr(weixin_mod, "RATE_LIMIT_BACKOFF_S", 0)
 
     with pytest.raises(RuntimeError, match="WeChat send text error"):
         await channel._send_text("wx-user", "hello", "")
 
-    # Only one API call (no retry possible without token)
-    channel._api_post.assert_awaited_once()
+    assert channel._api_post.await_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1440,13 +1451,14 @@ async def test_send_text_raises_on_ret_minus_two_when_no_context_token() -> None
 class TestIsStaleSessionRet:
     """Verify stale-session detection for iLink ret=-2 / errcode=-2 responses."""
 
-    def test_ret_minus_2_with_empty_errmsg_is_stale(self):
-        assert weixin_mod._is_stale_session_ret(-2, 0, "") is True
-        assert weixin_mod._is_stale_session_ret(-2, 0, None) is True
+    def test_ret_minus_2_with_empty_errmsg_is_not_stale(self):
+        # Empty errmsg is the rate-limit signal per wxclawbot-cli docs.
+        assert weixin_mod._is_stale_session_ret(-2, 0, "") is False
+        assert weixin_mod._is_stale_session_ret(-2, 0, None) is False
 
-    def test_errcode_minus_2_with_empty_errmsg_is_stale(self):
-        assert weixin_mod._is_stale_session_ret(0, -2, "") is True
-        assert weixin_mod._is_stale_session_ret(0, -2, None) is True
+    def test_errcode_minus_2_with_empty_errmsg_is_not_stale(self):
+        assert weixin_mod._is_stale_session_ret(0, -2, "") is False
+        assert weixin_mod._is_stale_session_ret(0, -2, None) is False
 
     def test_ret_minus_2_with_unknown_error_is_stale(self):
         assert weixin_mod._is_stale_session_ret(-2, 0, "unknown error") is True
@@ -1469,3 +1481,24 @@ class TestIsStaleSessionRet:
     def test_other_errors_are_not_stale(self):
         assert weixin_mod._is_stale_session_ret(-14, -14, "session timeout") is False
         assert weixin_mod._is_stale_session_ret(-100, 0, "internal error") is False
+
+
+@pytest.mark.asyncio
+async def test_send_text_rate_limit_backoff_succeeds(monkeypatch) -> None:
+    """If rate-limit retry succeeds after backoff, return normally."""
+    channel, _bus = _make_channel()
+    channel._client = object()
+    channel._token = "token"
+
+    channel._api_post = AsyncMock(
+        side_effect=[
+            {"ret": -2},  # first attempt — rate limit
+            {"ret": 0},   # backoff retry — success
+        ]
+    )
+
+    monkeypatch.setattr(weixin_mod, "RATE_LIMIT_BACKOFF_S", 0)
+
+    await channel._send_text("wx-user", "hello", "")
+
+    assert channel._api_post.await_count == 2

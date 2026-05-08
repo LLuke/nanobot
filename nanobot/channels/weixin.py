@@ -83,31 +83,26 @@ SESSION_PAUSE_DURATION_S = 60 * 60
 # iLink rate-limit / stale-session errcode
 RATE_LIMIT_ERRCODE = -2
 
+# iLink rate-limit backoff (wxclawbot-cli docs: ~7 msgs / 5 min per bot)
+RATE_LIMIT_BACKOFF_S = 60
+
 
 def _is_stale_session_ret(
     ret: int | None,
     errcode: int | None,
     errmsg: str | None,
 ) -> bool:
-    """True when iLink returns ret=-2 / errcode=-2 that is likely a stale
-    context_token rather than a genuine rate limit.
+    """True when iLink returns ret=-2 / errcode=-2 with 'unknown error',
+    which historically correlates with a stale context_token.
 
-    Empirically iLink signals these two scenarios weakly:
-    - stale session:      ret=-2, errmsg="unknown error" OR errmsg empty/None
-    - genuine rate limit: ret=-2 with a populated errmsg such as
-      "frequency limit" / "too frequently" / similar
-
-    Treating "unknown error" and empty/None errmsg as stale-session signals
-    lets the caller attempt one tokenless retry. A true rate limit still
-    falls through to the existing retry/backoff path if the tokenless
-    attempt also fails.
+    Note: per wxclawbot-cli docs, ret=-2 is primarily a *rate limit*
+    (~7 msgs / 5 min per bot).  We only treat the 'unknown error' variant
+    as stale-session because empty/missing errmsg is far more commonly
+    the rate-limit signal in practice.
     """
     if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
         return False
-    msg = (errmsg or "").strip().lower()
-    if not msg:
-        return True
-    return msg == "unknown error"
+    return (errmsg or "").strip().lower() == "unknown error"
 
 
 # Retry constants (matching the reference plugin's monitor.ts)
@@ -1176,20 +1171,16 @@ class WeixinChannel(BaseChannel):
             "base_info": BASE_INFO,
         }
 
-        data = await self._api_post("ilink/bot/sendmessage", body)
+        async def _do_send(_body: dict[str, Any]) -> dict:
+            return await self._api_post("ilink/bot/sendmessage", _body)
+
+        data = await _do_send(body)
         ret = data.get("ret", 0)
         errcode = data.get("errcode", 0)
         errmsg = data.get("errmsg", "")
 
-        # The iLink sendmessage API may return ret=-2 / errcode=-2 for two
-        # different reasons:
-        #   - stale context_token: errmsg is empty/None or "unknown error"
-        #   - genuine rate limit:  errmsg is populated (e.g. "frequency limit")
-        # Per hermes-agent#17228 / #18100, the empty/None variant is a stale
-        # session signal.  Retry once without context_token (iLink accepts
-        # tokenless sends as a degraded fallback).  If the tokenless attempt
-        # also fails, let _check_response_error raise so ChannelManager can
-        # retry with backoff — do NOT swallow the error.
+        # Stale session (errmsg == "unknown error") — retry once without token.
+        # This is distinct from the far more common rate-limit signal.
         if _is_stale_session_ret(ret, errcode, errmsg) and context_token:
             self.logger.warning(
                 "WeChat send text returned stale-session signal for {} (client_id={}); "
@@ -1199,7 +1190,7 @@ class WeixinChannel(BaseChannel):
             )
             body_no_ctx = copy.deepcopy(body)
             body_no_ctx["msg"].pop("context_token", None)
-            data = await self._api_post("ilink/bot/sendmessage", body_no_ctx)
+            data = await _do_send(body_no_ctx)
             ret = data.get("ret", 0)
             errcode = data.get("errcode", 0)
             errmsg = data.get("errmsg", "")
@@ -1215,6 +1206,23 @@ class WeixinChannel(BaseChannel):
                     "WeChat text sent to {} (client_id={})", to_user_id, client_id
                 )
                 return
+
+        # Rate limit (-2) — per wxclawbot-cli docs this is ~7 msgs / 5 min.
+        # Wait 60 s and retry once; do NOT strip context_token (rate limit is
+        # per-bot, not per-token).
+        if (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE):
+            self.logger.warning(
+                "WeChat send text rate limited for {} (client_id={}); "
+                "waiting {}s before retry",
+                to_user_id,
+                client_id,
+                RATE_LIMIT_BACKOFF_S,
+            )
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            data = await _do_send(body)
+            ret = data.get("ret", 0)
+            errcode = data.get("errcode", 0)
+            errmsg = data.get("errmsg", "")
 
         self._check_response_error(data, "send text", body=body)
         self.logger.debug("WeChat text sent to {} (client_id={})", to_user_id, client_id)
@@ -1362,12 +1370,15 @@ class WeixinChannel(BaseChannel):
             "base_info": BASE_INFO,
         }
 
-        data = await self._api_post("ilink/bot/sendmessage", body)
+        async def _do_send(_body: dict[str, Any]) -> dict:
+            return await self._api_post("ilink/bot/sendmessage", _body)
+
+        data = await _do_send(body)
         ret = data.get("ret", 0)
         errcode = data.get("errcode", 0)
         errmsg = data.get("errmsg", "")
 
-        # Same stale-session handling as _send_text (hermes-agent#17228 / #18100).
+        # Same stale-session handling as _send_text.
         if _is_stale_session_ret(ret, errcode, errmsg) and context_token:
             self.logger.warning(
                 "WeChat send media returned stale-session signal for {} (client_id={}); "
@@ -1377,7 +1388,7 @@ class WeixinChannel(BaseChannel):
             )
             body_no_ctx = copy.deepcopy(body)
             body_no_ctx["msg"].pop("context_token", None)
-            data = await self._api_post("ilink/bot/sendmessage", body_no_ctx)
+            data = await _do_send(body_no_ctx)
             ret = data.get("ret", 0)
             errcode = data.get("errcode", 0)
             errmsg = data.get("errmsg", "")
@@ -1390,6 +1401,21 @@ class WeixinChannel(BaseChannel):
                 self._context_tokens.pop(to_user_id, None)
                 self._save_state()
                 return
+
+        # Rate limit (-2) — wait and retry once (see _send_text for rationale).
+        if (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE):
+            self.logger.warning(
+                "WeChat send media rate limited for {} (client_id={}); "
+                "waiting {}s before retry",
+                to_user_id,
+                client_id,
+                RATE_LIMIT_BACKOFF_S,
+            )
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            data = await _do_send(body)
+            ret = data.get("ret", 0)
+            errcode = data.get("errcode", 0)
+            errmsg = data.get("errmsg", "")
 
         self._check_response_error(data, "send media", body=body)
 
