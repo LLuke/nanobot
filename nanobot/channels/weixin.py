@@ -87,22 +87,11 @@ RATE_LIMIT_ERRCODE = -2
 RATE_LIMIT_BACKOFF_S = 60
 
 
-def _is_stale_session_ret(
-    ret: int | None,
-    errcode: int | None,
-    errmsg: str | None,
-) -> bool:
-    """True when iLink returns ret=-2 / errcode=-2 with 'unknown error',
-    which historically correlates with a stale context_token.
-
-    Note: per wxclawbot-cli docs, ret=-2 is primarily a *rate limit*
-    (~7 msgs / 5 min per bot).  We only treat the 'unknown error' variant
-    as stale-session because empty/missing errmsg is far more commonly
-    the rate-limit signal in practice.
-    """
-    if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
-        return False
-    return (errmsg or "").strip().lower() == "unknown error"
+def _is_api_error(data: dict) -> bool:
+    """True when iLink response signals failure via ``ret`` or ``errcode``."""
+    ret = data.get("ret", 0)
+    errcode = data.get("errcode", 0)
+    return (ret is not None and ret != 0) or (errcode is not None and errcode != 0)
 
 
 # Retry constants (matching the reference plugin's monitor.ts)
@@ -185,6 +174,7 @@ class WeixinChannel(BaseChannel):
         self._session_pause_until: float = 0.0
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._typing_tickets: dict[str, dict[str, Any]] = {}
+        self._pending_tool_hints: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------
     # State persistence
@@ -521,6 +511,7 @@ class WeixinChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
+        self._pending_tool_hints.clear()
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
         for chat_id in list(self._typing_tasks):
@@ -551,18 +542,12 @@ class WeixinChannel(BaseChannel):
                 f"WeChat session paused, {remaining_min} min remaining (errcode {ERRCODE_SESSION_EXPIRED})"
             )
 
-    def _check_response_error(self, data: dict, operation: str, *, body: dict | None = None) -> None:
-        """Check both ``ret`` and ``errcode`` like the reference TS code.
-
-        The iLink API may signal failure through either field (or both).
-        ``_poll_once`` already checks both; outbound send helpers must do
-        the same to avoid silent drops.
-        """
+    def _check_response_error(self, data: dict, operation: str) -> None:
+        """Raise if *data* contains an iLink API error."""
+        if not _is_api_error(data):
+            return
         ret = data.get("ret", 0)
         errcode = data.get("errcode", 0)
-        is_error = (ret is not None and ret != 0) or (errcode is not None and errcode != 0)
-        if not is_error:
-            return
         raise RuntimeError(
             f"WeChat {operation} error (ret={ret}, errcode={errcode}): {data.get('errmsg', '')}"
         )
@@ -587,9 +572,8 @@ class WeixinChannel(BaseChannel):
         # Check for API-level errors (monitor.ts checks both ret and errcode)
         ret = data.get("ret", 0)
         errcode = data.get("errcode", 0)
-        is_error = (ret is not None and ret != 0) or (errcode is not None and errcode != 0)
 
-        if is_error:
+        if _is_api_error(data):
             if errcode == ERRCODE_SESSION_EXPIRED or ret == ERRCODE_SESSION_EXPIRED:
                 self._pause_session()
                 remaining = self._session_pause_remaining_s()
@@ -988,6 +972,39 @@ class WeixinChannel(BaseChannel):
         self._assert_session_active()
 
         is_progress = bool((msg.metadata or {}).get("_progress", False))
+
+        # Buffer tool hints to coalesce consecutive ones and avoid burning
+        # WeChat iLink rate-limit quota (~7 msgs / 5 min).
+        if is_progress and (msg.metadata or {}).get("_tool_hint"):
+            if not self.send_tool_hints:
+                return
+            self._pending_tool_hints.setdefault(msg.chat_id, []).append(msg.content)
+            self.logger.debug(
+                "Buffered tool hint for {} (count={})",
+                msg.chat_id,
+                len(self._pending_tool_hints[msg.chat_id]),
+            )
+            return
+
+        # Any non-tool-hint message (thought, final answer, /stop response, …)
+        # flushes the buffer so hints do not get stuck when the final answer
+        # is suppressed, streamed, or otherwise skips this path.
+        if not ((msg.metadata or {}).get("_tool_hint") and is_progress):
+            hints = self._pending_tool_hints.pop(msg.chat_id, None)
+            if hints:
+                ctx_token = self._context_tokens.get(msg.chat_id, "")
+                if ctx_token:
+                    self.logger.info(
+                        "Flushing {} buffered tool hint(s) for {}",
+                        len(hints), msg.chat_id,
+                    )
+                    await self._send_text(msg.chat_id, "\n".join(hints), ctx_token)
+                else:
+                    self.logger.warning(
+                        "Dropped {} buffered tool hint(s) for {}: no context_token",
+                        len(hints), msg.chat_id,
+                    )
+
         if not is_progress:
             await self._stop_typing(msg.chat_id, clear_remote=True)
 
@@ -1081,6 +1098,31 @@ class WeixinChannel(BaseChannel):
                 with suppress(Exception):
                     await self._send_typing(msg.chat_id, typing_ticket, TYPING_STATUS_CANCEL)
 
+    async def send_delta(
+        self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Weixin iLink does not support native streaming deltas.
+
+        We only hook ``_stream_end`` so buffered tool hints are flushed even
+        when the final answer carries the ``_streamed`` flag and bypasses
+        :meth:`send`.
+        """
+        if metadata and metadata.get("_stream_end"):
+            hints = self._pending_tool_hints.pop(chat_id, None)
+            if hints:
+                ctx_token = self._context_tokens.get(chat_id, "")
+                if ctx_token:
+                    self.logger.info(
+                        "Flushing {} buffered tool hint(s) for {} (stream_end)",
+                        len(hints), chat_id,
+                    )
+                    await self._send_text(chat_id, "\n".join(hints), ctx_token)
+                else:
+                    self.logger.warning(
+                        "Dropped {} buffered tool hint(s) for {}: no context_token",
+                        len(hints), chat_id,
+                    )
+
     async def _start_typing(self, chat_id: str, context_token: str = "") -> None:
         """Start typing indicator immediately when a message is received."""
         if not self._client or not self._token or not chat_id:
@@ -1141,6 +1183,59 @@ class WeixinChannel(BaseChannel):
         """
         return f"nanobot:{int(time.time() * 1000)}-{os.urandom(4).hex()}"
 
+    async def _send_message_with_retry(
+        self,
+        body: dict[str, Any],
+        context_token: str,
+        to_user_id: str,
+        client_id: str,
+        operation: str,
+    ) -> None:
+        """Post ``ilink/bot/sendmessage`` with stale-session and rate-limit handling."""
+        data = await self._api_post("ilink/bot/sendmessage", body)
+        ret = data.get("ret", 0)
+        errcode = data.get("errcode", 0)
+        errmsg = data.get("errmsg", "")
+
+        # Stale session (errmsg == "unknown error") — retry once without token.
+        if (
+            (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE)
+            and (errmsg or "").strip().lower() == "unknown error"
+            and context_token
+        ):
+            self.logger.warning(
+                "WeChat {} stale-session signal for {} (client_id={}); "
+                "retrying without context_token",
+                operation, to_user_id, client_id,
+            )
+            body_no_ctx = copy.deepcopy(body)
+            body_no_ctx["msg"].pop("context_token", None)
+            data = await self._api_post("ilink/bot/sendmessage", body_no_ctx)
+            ret = data.get("ret", 0)
+            errcode = data.get("errcode", 0)
+            errmsg = data.get("errmsg", "")
+            if ret == 0 and (errcode == 0 or errcode is None):
+                self.logger.warning(
+                    "WeChat {} succeeded WITHOUT context_token for {}; "
+                    "clearing expired token from cache",
+                    operation, to_user_id,
+                )
+                self._context_tokens.pop(to_user_id, None)
+                self._save_state()
+                return
+
+        # Rate limit (-2) — wait and retry once.
+        if ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE:
+            self.logger.warning(
+                "WeChat {} rate limited for {} (client_id={}); "
+                "waiting {}s before retry",
+                operation, to_user_id, client_id, RATE_LIMIT_BACKOFF_S,
+            )
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
+            data = await self._api_post("ilink/bot/sendmessage", body)
+
+        self._check_response_error(data, operation)
+
     async def _send_text(
         self,
         to_user_id: str,
@@ -1171,60 +1266,7 @@ class WeixinChannel(BaseChannel):
             "base_info": BASE_INFO,
         }
 
-        async def _do_send(_body: dict[str, Any]) -> dict:
-            return await self._api_post("ilink/bot/sendmessage", _body)
-
-        data = await _do_send(body)
-        ret = data.get("ret", 0)
-        errcode = data.get("errcode", 0)
-        errmsg = data.get("errmsg", "")
-
-        # Stale session (errmsg == "unknown error") — retry once without token.
-        # This is distinct from the far more common rate-limit signal.
-        if _is_stale_session_ret(ret, errcode, errmsg) and context_token:
-            self.logger.warning(
-                "WeChat send text returned stale-session signal for {} (client_id={}); "
-                "retrying without context_token",
-                to_user_id,
-                client_id,
-            )
-            body_no_ctx = copy.deepcopy(body)
-            body_no_ctx["msg"].pop("context_token", None)
-            data = await _do_send(body_no_ctx)
-            ret = data.get("ret", 0)
-            errcode = data.get("errcode", 0)
-            errmsg = data.get("errmsg", "")
-            if ret == 0 and (errcode == 0 or errcode is None):
-                self.logger.warning(
-                    "WeChat send text succeeded WITHOUT context_token for {}; "
-                    "clearing expired token from cache",
-                    to_user_id,
-                )
-                self._context_tokens.pop(to_user_id, None)
-                self._save_state()
-                self.logger.debug(
-                    "WeChat text sent to {} (client_id={})", to_user_id, client_id
-                )
-                return
-
-        # Rate limit (-2) — per wxclawbot-cli docs this is ~7 msgs / 5 min.
-        # Wait 60 s and retry once; do NOT strip context_token (rate limit is
-        # per-bot, not per-token).
-        if (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE):
-            self.logger.warning(
-                "WeChat send text rate limited for {} (client_id={}); "
-                "waiting {}s before retry",
-                to_user_id,
-                client_id,
-                RATE_LIMIT_BACKOFF_S,
-            )
-            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
-            data = await _do_send(body)
-            ret = data.get("ret", 0)
-            errcode = data.get("errcode", 0)
-            errmsg = data.get("errmsg", "")
-
-        self._check_response_error(data, "send text", body=body)
+        await self._send_message_with_retry(body, context_token, to_user_id, client_id, "send text")
         self.logger.debug("WeChat text sent to {} (client_id={})", to_user_id, client_id)
 
     async def _send_media_file(
@@ -1370,54 +1412,7 @@ class WeixinChannel(BaseChannel):
             "base_info": BASE_INFO,
         }
 
-        async def _do_send(_body: dict[str, Any]) -> dict:
-            return await self._api_post("ilink/bot/sendmessage", _body)
-
-        data = await _do_send(body)
-        ret = data.get("ret", 0)
-        errcode = data.get("errcode", 0)
-        errmsg = data.get("errmsg", "")
-
-        # Same stale-session handling as _send_text.
-        if _is_stale_session_ret(ret, errcode, errmsg) and context_token:
-            self.logger.warning(
-                "WeChat send media returned stale-session signal for {} (client_id={}); "
-                "retrying without context_token",
-                to_user_id,
-                client_id,
-            )
-            body_no_ctx = copy.deepcopy(body)
-            body_no_ctx["msg"].pop("context_token", None)
-            data = await _do_send(body_no_ctx)
-            ret = data.get("ret", 0)
-            errcode = data.get("errcode", 0)
-            errmsg = data.get("errmsg", "")
-            if ret == 0 and (errcode == 0 or errcode is None):
-                self.logger.warning(
-                    "WeChat send media succeeded WITHOUT context_token for {}; "
-                    "clearing expired token from cache",
-                    to_user_id,
-                )
-                self._context_tokens.pop(to_user_id, None)
-                self._save_state()
-                return
-
-        # Rate limit (-2) — wait and retry once (see _send_text for rationale).
-        if (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE):
-            self.logger.warning(
-                "WeChat send media rate limited for {} (client_id={}); "
-                "waiting {}s before retry",
-                to_user_id,
-                client_id,
-                RATE_LIMIT_BACKOFF_S,
-            )
-            await asyncio.sleep(RATE_LIMIT_BACKOFF_S)
-            data = await _do_send(body)
-            ret = data.get("ret", 0)
-            errcode = data.get("errcode", 0)
-            errmsg = data.get("errmsg", "")
-
-        self._check_response_error(data, "send media", body=body)
+        await self._send_message_with_retry(body, context_token, to_user_id, client_id, "send media")
 
 
 # ---------------------------------------------------------------------------
